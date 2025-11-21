@@ -1,0 +1,177 @@
+pipeline {
+    agent any
+    
+    tools {
+        maven 'maven3'
+        jdk 'jdk17'
+    }
+    
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        IMAGE_TAG = "v${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Git Checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'git', url: 'https://github.com/NeetuPal/Ultimate-Mega-Project.git'
+            }
+        }
+        
+        stage('Compile') {
+            steps {
+                sh "cd Mega-Project-CI-main && mvn compile"
+            }
+        }
+        
+        stage('Testing') {
+            steps {
+                sh "cd Mega-Project-CI-main && mvn test"
+            }
+        }
+        
+        stage('Trivy FS Scan') {
+            steps {
+                sh "cd Mega-Project-CI-main && trivy fs --format table -o fs-report.html ."
+            }
+        }
+        
+        stage('Sonar Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh '''
+                        cd Mega-Project-CI-main && $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectKey=gcbank \
+                        -Dsonar.projectName=gcbank \
+                        -Dsonar.java.binaries=target
+                    '''
+                }
+            }
+        }
+        
+        stage('Quality Gate Check') {
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh "cd Mega-Project-CI-main && mvn package"
+            }
+        }
+        
+        stage('Publish To Nexus') {
+            steps {
+                withMaven(globalMavenSettingsConfig: 'global-maven-settings', maven: 'maven3', traceability: true) {
+                    sh "cd Mega-Project-CI-main && mvn deploy"
+                }
+            }
+        }
+        
+       stage('Docker Image Build & Tag') {
+    steps {
+        script {
+            dir('Mega-Project-CI-main') {
+                withDockerRegistry(credentialsId: 'dockerhub-token') {
+                    sh "docker build -t neet95402927/bankapp1:$IMAGE_TAG ."
+                }
+            }
+        }
+    }
+}
+
+      stage('Scan Image') {
+    steps {
+        script {
+            dir('Mega-Project-CI-main') {
+    
+                sh "trivy image --format table -o image-report.html neet95402927/bankapp1:${IMAGE_TAG}"
+            }
+        }
+    }
+}
+
+        
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    dir('Mega-Project-CI-main') {
+                    withDockerRegistry(credentialsId: 'dockerhub-token') {
+                        sh "docker push neet95402927/bankapp1:$IMAGE_TAG"
+                    }
+                    }
+                }
+            }
+        }
+        
+        stage('Update Manifest File in Mega-Project-CD') {
+            steps {
+                script {
+                    // Clean workspace before starting
+                    cleanWs()
+
+                    withCredentials([usernamePassword(credentialsId: 'git-cred', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+                        sh '''
+                            # Clone the Mega-Project-CD repository
+                            git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/NeetuPal/Ultimate-Mega-Project.git
+                            
+                            # Update the image tag in the manifest.yaml file
+                            cd Ultimate-Mega-Project/Mega-Project-CD-main
+                            sed -i "s|neet95402927/bankapp1:.*|neet95402927/bankapp1:${IMAGE_TAG}|" Manifest/manifest.yaml
+                            
+                            # Confirm changes
+                            echo "Updated manifest file contents:"
+                            cat Manifest/manifest.yaml
+                            
+                            # Commit and push the changes
+                            git config user.name "NeetuPal"
+                            git config user.email "neetupalcs13#gmail.com"
+                            git add Manifest/manifest.yaml
+                            git commit -m "Update image tag to ${IMAGE_TAG}"
+                            git push origin main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    
+post {
+    always {
+        script {
+            def jobName = env.JOB_NAME
+            def buildNumber = env.BUILD_NUMBER
+            def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
+            def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
+
+            def body = """
+                <html>
+                <body>
+                <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                <h2>${jobName} - Build ${buildNumber}</h2>
+                <div style="background-color: ${bannerColor}; padding: 10px;">
+                <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                </div>
+                <p>Check the <a href="${BUILD_URL}">console output</a>.</p>
+                </div>
+                </body>
+                </html>
+            """
+
+            emailext (
+                subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                body: body,
+                to: 'neetupalcs13@gmail.com',
+                from: 'trial954029@gmail.com',
+                replyTo: 'neetupalcs13@gmail.com',
+                mimeType: 'text/html',
+               
+            )
+        }
+    }
+}
+}
